@@ -1,0 +1,254 @@
+#!/bin/bash
+
+# author: Andrew Klassen
+# email: aklassen80@yahoo.com
+
+
+# set output colors
+color_off='\033[0m'  
+
+black='\033[0;30m'        
+red='\033[0;31m'      
+green='\033[0;32m'     
+yellow='\033[0;33m'    
+blue='\033[0;34m'  
+purple='\033[0;35m' 
+cyan='\033[0;36m'  
+white='\033[0;37m'  
+
+
+#defaults
+port=22
+host="127.0.0.1"
+potental_user=("ec2-user" "ubuntu" "root")
+show_only=false
+dont_stop=false
+
+# When this tool runs with an aggressivness < 3, the t (timing) values define
+# the minimum and maximum number of seconds that this script must sleep before
+# it can make another connection attempt.
+# 
+# example: If t_min=5 and t_max=10, the script would draw a random number between 5 and 10
+# and then the script would sleep this number of seconds. This makes the scripts behavior more
+# indistiguishable from a human.
+t_min=0
+t_max=0
+
+# by default, this script looks recursively through every users home directory + the root user
+user_home_dir=($(ls -1 -d /home/*))
+user_home_dir+=('/root')
+
+# dealing with optional aguments
+positional_args=()
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -u|--user)
+      potental_user=($(echo "${2}" | tr ',' '\n'))
+      shift 
+      shift 
+      ;;
+    -p|--port)
+      port="$2"
+      shift 
+      shift 
+      ;;
+    -d|--dont-stop)
+      dont_stop=true
+      shift
+      ;;
+    -s|--show-only)
+      show_only=true
+      shift
+      ;;
+    --help)
+      echo ""
+      echo "Name: ssh-key-finder"
+      echo ""
+      echo "Description: Used to identify ssh keys and usernames needed to access a remote linux host. It works by recursivly finding all the private"
+      echo "keys in user's home directories and then attempting to connect with them."
+      echo ""
+      echo -e "${red}Warning: several automated ssh connnection attempts might have the appearance of malicious network traffic. Use this tool responsibly.${color_off}"
+      echo ""
+      echo "Usage: ssh-key-finder <optional_flags> <hostname>"
+      echo ""
+      echo "-d,--dont-stop"
+      echo "	This tool by default stops as soon as it makes a successful ssh attempt. --dont-stop will keep going until all possible"
+      echo "	connection attempts have been made."
+      echo ""
+      echo "-h,--home-directory"
+      echo "	Single or comma separated list of all directories this script should recurse through. By default all home directories are used, which"
+      echo "	might be slow on large systems."
+      echo ""
+      echo "-p,--port"
+      echo "	SSH port. 22 is used by default."
+      echo ""
+      echo "-s,--show-only"
+      echo "	Show all the ssh private keys found but don't make any connnection attempts."
+      echo ""
+      echo "-t 1,2,3"
+      echo "	Changes this tools timings/level of aggressivness. By default this script will attempt to find the"
+      echo "	correct ssh key and username as fast as possible (-t 3). This can set off security alarms in enviornments were"
+      echo "	traffic is heavly monitored. To avoid setting off alarms or to evade an IPS/IDS system, use either -t 2 or 1"
+      echo "	The lower the -t level, the slower this script will be, exponentally"
+      echo ""
+      echo "-u,--user"
+      echo "	Single or comma separated list of usernames to try connecting with. By default ec2-user, ubuntu, and root are used."
+      echo""
+      exit 0
+      shift
+      ;;
+    -h|--home-directory)
+      user_home_dir=($(echo "${2}" | tr ',' '\n'))
+      shift
+      shift
+      ;;
+    -t)
+      case $2 in
+	1)
+		t_min=5
+		t_max=69
+		;;
+	2)
+		t_min=1
+                t_max=8
+                ;;
+	3)
+		t_min=0
+                t_max=0
+                ;;
+
+      esac
+      shift
+      shift
+      ;;
+    -*|--*)
+      echo "Unknown option $1, see --help"
+      exit 1
+      ;;
+    *)
+      positional_args+=("$1") 
+      shift 
+      ;;
+  esac
+done
+
+set -- "${positional_args[@]}" # restore positional parameters
+
+
+# set host if user provided it, otherwise localhost is used
+if [ -n "${1}" ]; then
+	host=${1}
+fi
+
+
+# tool first makes a "mock" ssh connection to the server
+#  1. to see of the host is avalible
+#  2. accepts key-based authentication
+# script stops running and displays an error to user if either are true
+
+ssh_remote_host_response=$(ssh -p ${port} -o ConnectTimeout=3 -o BatchMode=yes -o PreferredAuthentications=none -o NoHostAuthenticationForLocalhost=yes -o StrictHostKeyChecking=no $host 2>&1)
+timed_out=$(echo $ssh_remote_host_response | grep "publickey" | wc -l)
+key_auth_supported=$(echo $ssh_remote_host_response | grep "publickey" | wc -l)
+
+if [[ $EUID -ne 0 ]]; then
+	echo -e "${red}this script needs to be ran as root${color_off}"
+	exit 1
+elif [[ $timed_out -eq 0 ]]; then
+	echo -e "${red}remote server timed out or is not listening for ssh on port ${port}${color_off}"
+        exit 2
+elif [[ $key_auth_supported -eq 0 ]]; then
+	echo -e "${red}remote server does not support key authentication${color_off}"
+	exit 3
+fi
+
+
+key=()
+ssh_connection=()
+
+
+echo "finding keys ..."
+
+# find all valid keys
+for home in "${user_home_dir[@]}"
+do
+	# recursively go through each user's home directory
+	current_key_found=($(grep -r -H -l "BEGIN OPENSSH PRIVATE KEY\|BEGIN RSA PRIVATE KEY" ${home} 2> /dev/null))
+	for current_key in "${current_key_found[@]}"
+	do
+		# use ssh-keygen to load the file that appears to be a key, this validates the key's format
+		private_key_error=$(ssh-keygen -y  -f ${current_key} 2>&1 | grep "error" | wc -l)
+		private_key_bad_permission=$(ssh-keygen -y  -f ${current_key} 2>&1 | grep "bad" | wc -l)
+
+		if [[ $private_key_error -gt 0 ]]; then
+			current_key_found=("${current_key_found[@]/$current_key}")
+		elif [[ $private_key_bad_permission -gt 0 ]]; then
+			current_key_found=("${current_key_found[@]/$current_key}")
+			echo -e "${yellow}warning${color_off}: key ${current_key} has bad permissions, can't test until permissions are set to 0600"
+		fi	
+	done
+
+	key+=(${current_key_found[@]})
+
+done
+
+
+# show only mode
+if [[ $show_only == true ]]; then
+	for current_key in "${key[@]}"
+	do
+		echo "${current_key}"
+	done
+	exit 0
+fi
+
+
+# build connection array
+# every element in the connection array is formated 
+# 	<path_to_keyfile>:<username>
+# by having all the connection info in 1 array, this tool can shuffle/randomize the connections better
+for current_key in "${key[@]}"
+do
+        for user in "${potental_user[@]}"
+	do 
+		ssh_connection+=(${current_key}:${user})
+	done
+done
+
+# shuffle the array
+ssh_connection=($(shuf -e "${ssh_connection[@]}"))
+
+
+echo "finished gathering keys, testing the keys"
+echo "*****************************************"
+echo ""
+
+
+for current_connection in "${ssh_connection[@]}"
+do
+	if [[ ${t_max} > 0 ]]; then
+
+                sleep_number=$(( $RANDOM % ${t_max} + ${t_min} ))
+                sleep $sleep_number
+        fi
+
+
+	key_path=$(echo $current_connection | cut -f1 -d":")
+	user=$(echo $current_connection | cut -f2 -d":")
+	connection_failed=$(ssh -p ${port} -T -i ${key_path} -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no ${user}@${host} exit 2>&1 | wc -c)
+	
+	if [[ $connection_failed -gt 0 ]]; then
+		echo -e "${key_path}:${user} (${red}failed${color_off})"
+	else
+		echo -e "${green}${key_path}:${user} (success)${color_off}"
+		
+		if [[ $dont_stop == false ]]; then
+			echo ""
+			exit 0
+		fi
+	fi
+
+done
+
+echo ""
+exit 0
